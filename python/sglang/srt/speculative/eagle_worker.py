@@ -668,14 +668,6 @@ class EAGLEWorker(TpModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
-            if torch.isnan(hidden_states).any():
-                raise ValueError(
-                    f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
-                )
-            if torch.isnan(scores).any():
-                raise ValueError(
-                    f"Detected NaN values: {scores[torch.isnan(scores)]=}"
-                )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -998,15 +990,8 @@ class EAGLEWorker(TpModelWorker):
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
         """Redistribute the probability mass of cold tokens."""
-        # # TODO: Remove this before benchmarking
-        # if torch.isnan(probs).any():
-        #     raise ValueError("Detected errors during sampling! NaN in the probs.")
-
         if getattr(self, "num_cold_tokens", 0) == 0 or self.weaker_drafter is None:
             return probs
-
-        if not torch.allclose(probs.sum(dim=-1), torch.ones_like(probs.sum(dim=-1))):
-            raise ValueError("Probs do not sum to 1!")
 
         # Note: The last entry of the probs lower bounds the accumulated probability of cold tokens
         cold_token_probs = probs[..., -1].unsqueeze(1)
@@ -1021,13 +1006,6 @@ class EAGLEWorker(TpModelWorker):
         logger.debug(f"{redistributed_cold_probs.sum(dim=-1).sum().item()=}")
 
         probs = torch.cat([hot_token_probs, redistributed_cold_probs], dim=-1)
-
-        # Check if normalization is needed
-        if not torch.allclose(probs.sum(dim=-1), torch.ones_like(probs.sum(dim=-1))):
-            raise ValueError("Probs do not sum to 1!")
-        # # Normalize the probs with L1 norm
-        # probs = torch.nn.functional.normalize(probs, p=1, dim=-1)
-        
         return probs
 
     def capture_for_decode(
