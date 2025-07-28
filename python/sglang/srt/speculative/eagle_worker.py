@@ -981,13 +981,8 @@ class EAGLEWorker(TpModelWorker):
         # Note: The last entry of the probs lower bounds the accumulated probability of cold tokens
         cold_token_probs = probs[..., -1].unsqueeze(1)
         hot_token_probs = probs[..., :-1]
-        # Reshape weaker_drafter for broadcasting
-        weaker_drafter_reshaped = self.weaker_drafter.unsqueeze(0)
         # Redistribute probabilities
-        redistributed_cold_probs = cold_token_probs * weaker_drafter_reshaped
-        logger.debug(f"{redistributed_cold_probs.sum(dim=-1)=}")
-        logger.debug(f"{redistributed_cold_probs.sum(dim=-1).mean().item()=}")
-        probs = torch.cat([hot_token_probs, redistributed_cold_probs], dim=-1)
+        probs = torch.cat([hot_token_probs, cold_token_probs * self.weaker_drafter.unsqueeze(0)], dim=-1)
         return probs
 
     def capture_for_decode(
