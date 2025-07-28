@@ -689,7 +689,6 @@ class EAGLEWorker(TpModelWorker):
             )
             self._detect_nan_if_needed(logits_output)
             self._post_process_draft_logits(logits_output)
-            self._detect_nan_if_needed(logits_output)
             probs = safe_softmax(logits_output.next_token_logits)
             probs = self._post_process_draft_probs(probs)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -950,7 +949,6 @@ class EAGLEWorker(TpModelWorker):
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
-            self._detect_nan_if_needed(logits_output)
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         self._detect_nan_if_needed(logits_output)
