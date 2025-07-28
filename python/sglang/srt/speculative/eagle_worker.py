@@ -149,6 +149,8 @@ class EAGLEWorker(TpModelWorker):
         else:
             if self.hot_token_id is not None:
                 head = head.clone()
+                # use float64 to avoid overflow
+                head.data = head.data.to(torch.float64)
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 # Create a boolean mask for hot tokens
                 vocab_size = head.data.shape[0]
@@ -973,42 +975,42 @@ class EAGLEWorker(TpModelWorker):
 
     def _post_process_draft_logits(self, logits_output: LogitsProcessorOutput):
         """Lower bound the ExpSumLog for out-of-vocab tokens."""
-        logger.debug("post_process_draft_logits")
         if getattr(self, "num_cold_tokens", 0) == 0:
             return
 
         # Note: The last entry of the logits corresponds to the sum of cold tokens
         logits = logits_output.next_token_logits
 
-        # Clamp inf values to avoid NaN in softmax
-        logger.debug(f"Before clamp: {logits=}")
-        finfo = torch.finfo(logits.dtype)
-        logits.clamp_(min=finfo.min, max=finfo.max)
-        logger.debug(f"After clamp: {logits=}")
+        # # Clamp inf values to avoid NaN in softmax
+        # logger.debug(f"Before clamp: {logits=}")
+        # finfo = torch.finfo(logits.dtype)
+        # logits.clamp_(min=finfo.min, max=finfo.max)
+        # logger.debug(f"After clamp: {logits=}")
 
         cold_token_logits = logits[..., -1]
-        logger.debug(f"{cold_token_logits=}")
-        logger.debug(f"{self.num_cold_tokens=}")
-        logger.debug(f"{self.log_num_cold_tokens=}")
+        # logger.debug(f"{cold_token_logits=}")
+        # logger.debug(f"{self.num_cold_tokens=}")
+        # logger.debug(f"{self.log_num_cold_tokens=}")
 
         logits[..., -1] = self.log_num_cold_tokens + (
             cold_token_logits / self.num_cold_tokens
         )
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
-        logger.debug("post_process_draft_probs")
         """Redistribute the probability mass of cold tokens."""
-        # TODO: Remove this before benchmarking
-        if torch.isnan(probs).any():
-            raise ValueError("Detected errors during sampling! NaN in the probs.")
+        # # TODO: Remove this before benchmarking
+        # if torch.isnan(probs).any():
+        #     raise ValueError("Detected errors during sampling! NaN in the probs.")
 
         if getattr(self, "num_cold_tokens", 0) == 0 or self.weaker_drafter is None:
             return probs
 
+        if not torch.allclose(probs.sum(dim=-1), torch.ones_like(probs.sum(dim=-1))):
+            raise ValueError("Probs do not sum to 1!")
+
         # Note: The last entry of the probs lower bounds the accumulated probability of cold tokens
         cold_token_probs = probs[..., -1].unsqueeze(1)
         hot_token_probs = probs[..., :-1]
-        logger.debug(f"{hot_token_probs[..., -1]=}")
 
         # Reshape weaker_drafter for broadcasting
         weaker_drafter_reshaped = self.weaker_drafter.unsqueeze(0)
@@ -1016,20 +1018,16 @@ class EAGLEWorker(TpModelWorker):
         # Redistribute probabilities
         redistributed_cold_probs = cold_token_probs * weaker_drafter_reshaped
         logger.debug(f"{redistributed_cold_probs.sum(dim=-1)=}")
+        logger.debug(f"{redistributed_cold_probs.sum(dim=-1).sum().item()=}")
 
         probs = torch.cat([hot_token_probs, redistributed_cold_probs], dim=-1)
-        # TODO: Remove this before benchmarking
-        if torch.isnan(probs).any():
-            raise ValueError("Detected errors during sampling! NaN in the probs.")
-        logger.debug(f"{probs[..., -1]=}")
-        # Normalize the probs with L1 norm
-        probs = torch.nn.functional.normalize(probs, p=1, dim=-1)
-        sum_after_norm = probs.sum(dim=-1)
-        logger.debug(f"Sum after normalization: {sum_after_norm=}")
-        logger.debug(
-            f"Checking with allclose after normalization: "
-            f"{torch.allclose(sum_after_norm, torch.ones_like(sum_after_norm))=}"
-        )
+
+        # Check if normalization is needed
+        if not torch.allclose(probs.sum(dim=-1), torch.ones_like(probs.sum(dim=-1))):
+            raise ValueError("Probs do not sum to 1!")
+        # # Normalize the probs with L1 norm
+        # probs = torch.nn.functional.normalize(probs, p=1, dim=-1)
+        
         return probs
 
     def capture_for_decode(
