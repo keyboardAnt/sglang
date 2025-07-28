@@ -149,8 +149,8 @@ class EAGLEWorker(TpModelWorker):
         else:
             if self.hot_token_id is not None:
                 head = head.clone()
-                # use float64 to avoid overflow
-                head.data = head.data.to(torch.float64)
+                # Use a higher precision to avoid overflow
+                head.data = head.data.to(torch.float32)
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 # Create a boolean mask for hot tokens
                 vocab_size = head.data.shape[0]
