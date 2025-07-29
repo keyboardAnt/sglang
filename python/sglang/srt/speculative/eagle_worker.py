@@ -160,10 +160,11 @@ class EAGLEWorker(TpModelWorker):
                 vocab_size = head.data.shape[0]
                 mask_hot = torch.zeros(vocab_size, dtype=torch.bool, device=head.device)
                 mask_hot[self.hot_token_id] = True
-                # Find the cold token ids so we later map indices back to the full vocabulary
-                self.cold_token_id = torch.arange(
+                # Save the permuted token ids so we later map indices from back to the original, full vocabulary
+                cold_token_id = torch.arange(
                     head.data.shape[0], device=head.device
                 )[~mask_hot]
+                self.permuted_token_id = torch.cat([self.hot_token_id, cold_token_id])
                 # Save the number of cold tokens
                 self.num_cold_tokens = torch.sum(~mask_hot).item()
                 if self.num_cold_tokens > 0:
@@ -657,7 +658,8 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
-
+        if self.hot_token_id is not None:
+            topk_index = self.permuted_token_id[topk_index]
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
         )
@@ -700,6 +702,8 @@ class EAGLEWorker(TpModelWorker):
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             probs = self._post_process_draft_probs(probs)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.hot_token_id is not None:
+                topk_index = self.permuted_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
         return score_list, token_list, parents_list
