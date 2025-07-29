@@ -151,6 +151,7 @@ class EAGLEWorker(TpModelWorker):
 
         else:
             if self.hot_token_id is not None:
+                # Prune the head to keep only the hot tokens
                 head = head.clone()
                 # Use a higher precision to avoid overflow
                 head.data = head.data.to(torch.float32)
@@ -159,6 +160,10 @@ class EAGLEWorker(TpModelWorker):
                 vocab_size = head.data.shape[0]
                 mask_hot = torch.zeros(vocab_size, dtype=torch.bool, device=head.device)
                 mask_hot[self.hot_token_id] = True
+                # Find the cold token ids so we later map indices back to the full vocabulary
+                self.cold_token_id = torch.arange(
+                    head.data.shape[0], device=head.device
+                )[~mask_hot]
                 # Save the number of cold tokens
                 self.num_cold_tokens = torch.sum(~mask_hot).item()
                 if self.num_cold_tokens > 0:
@@ -997,7 +1002,10 @@ class EAGLEWorker(TpModelWorker):
         cold_token_probs = probs[..., -1].unsqueeze(1)
         hot_token_probs = probs[..., :-1]
         # Redistribute probabilities
-        probs = torch.cat([hot_token_probs, cold_token_probs * self.weaker_drafter.unsqueeze(0)], dim=-1)
+        probs = torch.cat(
+            [hot_token_probs, cold_token_probs * self.weaker_drafter.unsqueeze(0)],
+            dim=-1,
+        )
         return probs
 
     def capture_for_decode(
