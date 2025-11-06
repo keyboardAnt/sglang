@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
+    # Optional: drafter probabilities aligned with `draft_token` order
+    # Shape: (bs, draft_token_num, vocab_size)
+    draft_probs: Optional[torch.Tensor] = None
     custom_mask: torch.Tensor
     positions: torch.Tensor
     retrive_index: torch.Tensor
@@ -319,9 +322,26 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
-            draft_probs = torch.zeros(
-                target_probs.shape, dtype=torch.float32, device=batch.device
-            )
+            # Use propagated drafter probabilities when available; otherwise zeros
+            if self.draft_probs is not None:
+                # Expect shape (bs, draft_token_num, vocab_size)
+                assert (
+                    self.draft_probs.shape == target_probs.shape
+                ), f"draft_probs shape mismatch: {self.draft_probs.shape} vs {target_probs.shape}"
+                draft_probs = self.draft_probs
+            else:
+                draft_probs = torch.zeros(
+                    target_probs.shape, dtype=torch.float32, device=batch.device
+                )
+
+            # Debug: basic sanity print (will be removed before PR)
+            try:
+                nonzero_rows = (draft_probs.sum(dim=-1) > 0).sum(dim=1)
+                print(
+                    f"[EAGLE verify] draft_probs rows with data per batch: {nonzero_rows.tolist()}"
+                )
+            except Exception:
+                pass
 
             # coins for rejection sampling
             coins = torch.rand_like(
@@ -591,6 +611,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     topk_index: torch.Tensor = None
     # shape: (b, hidden_size)
     hidden_states: torch.Tensor = None
+    # Drafter's full distribution for the first step after extend/prefill
+    # shape: (b, vocab_size)
+    draft_step0_probs: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Inputs for extend

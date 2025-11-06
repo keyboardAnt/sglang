@@ -263,8 +263,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 # Skip attention backend init for 1-step draft,
                 # `draft_forward` only does sample in this case.
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
+            parent_list, top_scores_index, draft_tokens, depth1_probs = (
+                self.draft_forward(forward_batch)
             )
 
         # Build tree mask
@@ -294,9 +294,46 @@ class EagleDraftWorker(BaseDraftWorker):
             tree_mask_buf,
             position_buf,
         )
+        # Build draft_probs (partial propagation): root + depth-1 coverage
+        draft_probs = None
+        try:
+            bs = len(model_worker_batch.seq_lens)
+            vocab_size = None
+            if draft_input.draft_step0_probs is not None:
+                vocab_size = draft_input.draft_step0_probs.shape[-1]
+            if "depth1_probs" in locals() and depth1_probs is not None:
+                vocab_size = depth1_probs.shape[-1]
+            if vocab_size is not None:
+                draft_probs = torch.zeros(
+                    (bs, self.speculative_num_draft_tokens, vocab_size),
+                    dtype=torch.float32,
+                    device=draft_tokens.device,
+                )
+                if draft_input.draft_step0_probs is not None:
+                    draft_probs[:, 0, :] = draft_input.draft_step0_probs.to(
+                        dtype=torch.float32, device=draft_tokens.device
+                    )
+                if depth1_probs is not None:
+                    for b in range(bs):
+                        for j in range(top_scores_index.shape[1]):
+                            gidx = top_scores_index[b, j].item()
+                            if gidx < self.topk:
+                                row = b * self.topk + gidx
+                                draft_probs[b, j + 1, :] = depth1_probs[row].to(
+                                    dtype=torch.float32
+                                )
+            # Debug print (will be removed before PR)
+            if draft_probs is not None:
+                nonzero_rows = (draft_probs.sum(dim=-1) > 0).sum(dim=1)
+                print(
+                    f"[EAGLE v2] Built draft_probs (partial); nonzero rows per batch: {nonzero_rows.tolist()}"
+                )
+        except Exception as e:
+            print(f"[EAGLE v2] Building draft_probs failed: {e}")
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
+            draft_probs=draft_probs,
             custom_mask=tree_mask,
             positions=position,
             retrive_index=retrive_index,
@@ -337,6 +374,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
+        depth1_probs = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens_tmp(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -363,6 +401,8 @@ class EagleDraftWorker(BaseDraftWorker):
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            if i == 0:
+                depth1_probs = probs
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
@@ -492,6 +532,8 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        # Save full drafter probs for the first step after extend
+        next_draft_input.draft_step0_probs = probs
 
 
 class EAGLEWorkerV2(BaseSpecWorker):

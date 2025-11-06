@@ -290,7 +290,23 @@ class EagleVerifyInputV2Mixin:
                 ),
             )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-            draft_probs = torch.zeros_like(target_probs)
+            # Use propagated drafter probabilities if available; fallback to zeros
+            if getattr(self, "draft_probs", None) is not None:
+                assert (
+                    self.draft_probs.shape == target_probs.shape
+                ), f"draft_probs shape mismatch: {self.draft_probs.shape} vs {target_probs.shape}"
+                draft_probs = self.draft_probs
+            else:
+                draft_probs = torch.zeros_like(target_probs)
+
+            # Debug: basic sanity print (will be removed before PR)
+            try:
+                nonzero_rows = (draft_probs.sum(dim=-1) > 0).sum(dim=1)
+                print(
+                    f"[EAGLE v2 sample] draft_probs rows with data per batch: {nonzero_rows.tolist()}"
+                )
+            except Exception:
+                pass
 
             # coins for rejection sampling
             coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
