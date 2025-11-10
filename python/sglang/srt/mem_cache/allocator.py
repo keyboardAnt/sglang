@@ -80,12 +80,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             self.free(torch.cat(self.free_group))
 
     def merge_and_sort_free(self):
-        if len(self.release_pages) > 0:
-            self.free_pages = torch.cat((self.free_pages, self.release_pages))
-            self.free_pages, _ = torch.sort(self.free_pages)
-            self.release_pages = torch.empty(
-                (0,), dtype=self.release_pages.dtype, device=self.device
-            )
+          if len(self.release_pages) > 0:
+              # Always merge; only sort in debug mode to save overhead in prod.
+              self.free_pages = torch.cat((self.free_pages, self.release_pages))
+              if getattr(self, "debug_mode", False):
+                  self.free_pages, _ = torch.sort(self.free_pages)
+              self.release_pages = torch.empty(
+                  (0,), dtype=self.release_pages.dtype, device=self.device
+              )
 
     def get_cpu_copy(self, *args, **kwargs):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
@@ -424,6 +426,56 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
         self.clear()
+        # Debug-only page ownership bitmap: 1 = allocated, 0 = free
+        if self.debug_mode:
+            # 1-based page IDs; allocate num_pages+1 so index 0 is unused
+            self.page_bitmap = torch.zeros(
+                (self.num_pages + 1,), dtype=torch.uint8, device=self.device
+            )
+
+    # ----- Debug helpers -----
+    def _mark_pages_allocated(self, page_ids: torch.Tensor):
+        if not getattr(self, "debug_mode", False):
+            return
+        if page_ids.numel() == 0:
+            return
+        page_ids = page_ids.to(dtype=torch.long)
+        prev = self.page_bitmap.index_select(0, page_ids)
+        # Ensure not previously allocated
+        if not torch.all(prev == 0).item():
+            raise AssertionError("Paged allocator: double-alloc detected")
+        self.page_bitmap.index_fill_(0, page_ids, 1)
+
+    def _mark_pages_freed(self, page_ids: torch.Tensor):
+        if not getattr(self, "debug_mode", False):
+            return
+        if page_ids.numel() == 0:
+            return
+        page_ids = page_ids.to(dtype=torch.long)
+        prev = self.page_bitmap.index_select(0, page_ids)
+        # Ensure previously allocated
+        if not torch.all(prev == 1).item():
+            raise AssertionError("Paged allocator: double-free or free of unallocated page")
+        self.page_bitmap.index_fill_(0, page_ids, 0)
+
+    # ----- New page-granular free API -----
+    def free_page_ids(self, page_ids: torch.Tensor) -> None:
+        """
+        Free unique page IDs (1-based). Caller must ensure one entry per freed page.
+        """
+        if page_ids.numel() == 0:
+            return
+        # Debug guard
+        self._mark_pages_freed(page_ids)
+        # Append directly without sort/dedup
+        if self.is_not_in_free_group:
+            self.release_pages = torch.cat((page_ids.to(self.free_pages.dtype), self.release_pages))
+        else:
+            # In grouped mode, keep collecting token indices; callers should avoid grouping pages.
+            # As a safe fallback, convert page IDs back to token indices for grouping by pushing
+            # one representative token per page (page*page_size). This path is rare.
+            repr_tokens = (page_ids.to(dtype=torch.long) * self.page_size).to(self.device)
+            self.free_group.append(repr_tokens)
 
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
@@ -439,6 +491,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         out_pages = self.free_pages[:num_pages]
+        # Debug bitmap: mark allocated pages
+        self._mark_pages_allocated(out_pages)
         self.free_pages = self.free_pages[num_pages:]
 
         out_indices = (
@@ -495,6 +549,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        # Debug bitmap: mark allocated pages (first num_new_pages in current free list)
+        if num_new_pages > 0:
+            self._mark_pages_allocated(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -538,6 +595,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        # Debug bitmap: mark allocated pages (first num_new_pages in current free list)
+        if num_new_pages > 0:
+            self._mark_pages_allocated(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -545,11 +605,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
-            self.release_pages = torch.cat((free_page_indices, self.release_pages))
-        else:
-            self.free_group.append(free_index)
+        # Compatibility shim: convert tokens to unique page IDs, then delegate
+        page_ids = torch.unique(free_index // self.page_size)
+        self.free_page_ids(page_ids)
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
@@ -703,6 +761,8 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        if num_new_pages > 0:
+            self._mark_pages_allocated(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -745,6 +805,8 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        if num_new_pages > 0:
+            self._mark_pages_allocated(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 

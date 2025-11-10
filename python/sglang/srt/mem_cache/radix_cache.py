@@ -225,7 +225,10 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            tail = kv_indices[page_aligned_len:]
+            if len(tail) > 0:
+                tail_pages = torch.unique(tail // self.page_size)
+                self.token_to_kv_pool_allocator.free_page_ids(tail_pages)
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
@@ -234,9 +237,15 @@ class RadixCache(BasePrefixCache):
         new_prefix_len = self.insert(
             token_ids[:page_aligned_len], page_aligned_kv_indices
         )
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
-        )
+        if self.page_size != 1:
+            segment = kv_indices[len(req.prefix_indices) : new_prefix_len]
+            if len(segment) > 0:
+                seg_pages = torch.unique(segment // self.page_size)
+                self.token_to_kv_pool_allocator.free_page_ids(seg_pages)
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[len(req.prefix_indices) : new_prefix_len]
+            )
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -264,9 +273,15 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
-        )
+        if self.page_size != 1:
+            segment = kv_indices[len(req.prefix_indices) : new_prefix_len]
+            if len(segment) > 0:
+                seg_pages = torch.unique(segment // self.page_size)
+                self.token_to_kv_pool_allocator.free_page_ids(seg_pages)
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[len(req.prefix_indices) : new_prefix_len]
+            )
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
@@ -310,7 +325,11 @@ class RadixCache(BasePrefixCache):
             if x.lock_ref > 0:
                 continue
 
-            self.token_to_kv_pool_allocator.free(x.value)
+            if self.page_size != 1:
+                freed_pages = torch.unique(x.value // self.page_size)
+                self.token_to_kv_pool_allocator.free_page_ids(freed_pages)
+            else:
+                self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 

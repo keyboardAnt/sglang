@@ -434,7 +434,11 @@ class SWARadixCache(BasePrefixCache):
                 req.req_pool_idx,
                 : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            if self.page_size != 1:
+                page_ids = torch.unique(kv_indices // self.page_size)
+                self.token_to_kv_pool_allocator.free_page_ids(page_ids)
+            else:
+                self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
@@ -446,7 +450,10 @@ class SWARadixCache(BasePrefixCache):
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            tail = kv_indices[page_aligned_len:]
+            if len(tail) > 0:
+                tail_pages = torch.unique(tail // self.page_size)
+                self.token_to_kv_pool_allocator.free_page_ids(tail_pages)
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.clone()
@@ -543,7 +550,11 @@ class SWARadixCache(BasePrefixCache):
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
 
                 # 1. free node kv indices, evict full and swa tokens
-                self.token_to_kv_pool_allocator.free(x.value)
+                if self.page_size != 1:
+                    freed_pages = torch.unique(x.value // self.page_size)
+                    self.token_to_kv_pool_allocator.free_page_ids(freed_pages)
+                else:
+                    self.token_to_kv_pool_allocator.free(x.value)
                 full_num_evicted += len(x.value)
                 swa_num_evicted += len(x.value)
 
@@ -592,7 +603,11 @@ class SWARadixCache(BasePrefixCache):
                         x.full_lock_ref == 0
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
-                    self.token_to_kv_pool_allocator.free(x.value)
+                    if self.page_size != 1:
+                        freed_pages = torch.unique(x.value // self.page_size)
+                        self.token_to_kv_pool_allocator.free_page_ids(freed_pages)
+                    else:
+                        self.token_to_kv_pool_allocator.free(x.value)
                     full_num_evicted += len(x.value)
                     swa_num_evicted += len(x.value)
 
@@ -870,7 +885,13 @@ class SWARadixCache(BasePrefixCache):
                     assert (
                         node.swa_lock_ref == 0
                     ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
-                    self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
+                    if self.page_size != 1:
+                        seg = node.value[first_diff_idx:]
+                        if len(seg) > 0:
+                            seg_pages = torch.unique(seg // self.page_size)
+                            self.token_to_kv_pool_allocator.free_page_ids(seg_pages)
+                    else:
+                        self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
                     node.value = value[:prefix_len]
                     node.swa_tombstone = False
 
@@ -879,9 +900,15 @@ class SWARadixCache(BasePrefixCache):
 
                     self.swa_evictable_size_ += len(node.value)
                 else:
-                    self.token_to_kv_pool_allocator.free(
-                        value[first_diff_idx:prefix_len]
-                    )
+                    if self.page_size != 1:
+                        seg = value[first_diff_idx:prefix_len]
+                        if len(seg) > 0:
+                            seg_pages = torch.unique(seg // self.page_size)
+                            self.token_to_kv_pool_allocator.free_page_ids(seg_pages)
+                    else:
+                        self.token_to_kv_pool_allocator.free(
+                            value[first_diff_idx:prefix_len]
+                        )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -917,7 +944,11 @@ class SWARadixCache(BasePrefixCache):
                 node.parent.swa_lock_ref == 0
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
-            self.token_to_kv_pool_allocator.free(node.parent.value)
+            if self.page_size != 1:
+                freed_pages = torch.unique(node.parent.value // self.page_size)
+                self.token_to_kv_pool_allocator.free_page_ids(freed_pages)
+            else:
+                self.token_to_kv_pool_allocator.free(node.parent.value)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)

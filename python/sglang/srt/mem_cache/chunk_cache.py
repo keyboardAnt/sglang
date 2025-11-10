@@ -45,7 +45,11 @@ class ChunkCache(BasePrefixCache):
             : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        if self.page_size != 1:
+            page_ids = torch.unique(kv_indices // self.page_size)
+            self.token_to_kv_pool_allocator.free_page_ids(page_ids)
+        else:
+            self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req):
         kv_indices = self.req_to_token_pool.req_to_token[
